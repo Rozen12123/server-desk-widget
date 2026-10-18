@@ -1,0 +1,12 @@
+{
+  "refresh_seconds": 30,
+  "servers": [
+    {
+      "name": "训练节点 A",
+      "host": "192.0.2.10",
+      "user": "monitor",
+      "port": 22,
+      "key_file": "C:/Users/you/.ssh/id_ed25519"
+    }
+  ]
+}

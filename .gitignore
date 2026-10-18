@@ -1,0 +1,7 @@
+servers.json
+widget_state.json
+__pycache__/
+preview.png
+.venv/
+venv/
+*.pyc

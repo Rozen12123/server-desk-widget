@@ -5,3 +5,4 @@ preview.png
 .venv/
 venv/
 *.pyc
+widget_success.json

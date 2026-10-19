@@ -79,12 +79,13 @@ def set_autostart(enabled: bool) -> None:
                 pass
 
 
-def load_position(screen_width: int, screen_height: int) -> tuple[int, int]:
-    default = (max(16, screen_width - WIDTH - 28), min(88, max(16, screen_height - HEIGHT - 16)))
+def load_position(screen_width: int, screen_height: int, widget_height: int = HEIGHT) -> tuple[int, int]:
+    default = (max(16, screen_width - WIDTH - 28),
+               min(88, max(16, screen_height - widget_height - 16)))
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         x, y = int(data["x"]), int(data["y"])
-        if 0 <= x <= screen_width - 100 and 0 <= y <= screen_height - 80:
+        if 0 <= x <= max(0, screen_width - WIDTH) and 0 <= y <= max(0, screen_height - widget_height):
             return x, y
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -122,7 +123,8 @@ def attach_to_desktop(root: tk.Tk, x: int, y: int) -> bool:
     above_desktop = user32.GetWindow(progman, 3)  # GW_HWNDPREV
     if not above_desktop:
         return False
-    return bool(user32.SetWindowPos(wrapper, above_desktop, x, y, WIDTH, HEIGHT,
+    return bool(user32.SetWindowPos(wrapper, above_desktop, x, y,
+                                    root.winfo_width(), root.winfo_height(),
                                     0x0010 | 0x0040))
 
 
@@ -134,9 +136,12 @@ class Widget(tk.Tk):
         self.configure(bg=BG)
         self.resizable(False, False)
         self.preview = preview
-        self.x, self.y = load_position(self.winfo_screenwidth(), self.winfo_screenheight())
-        self.geometry(f"{WIDTH}x{HEIGHT}+{self.x}+{self.y}")
-        self.canvas = tk.Canvas(self, width=WIDTH, height=HEIGHT, bg=BG,
+        self.widget_height = HEIGHT
+        self.row_height = 40.0
+        screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.x, self.y = load_position(screen_width, screen_height, self.widget_height)
+        self.geometry(f"{WIDTH}x{self.widget_height}+{self.x}+{self.y}")
+        self.canvas = tk.Canvas(self, width=WIDTH, height=self.widget_height, bg=BG,
                                 highlightthickness=0, bd=0)
         self.canvas.pack()
         self.canvas.bind("<ButtonPress-1>", self.press)
@@ -191,9 +196,21 @@ class Widget(tk.Tk):
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self.servers = []
             self.error_text = f"配置未就绪：{exc}"
+        self.fit_to_server_count(len(self.servers))
         self.data.clear()
         self.draw()
         self.refresh()
+
+    def fit_to_server_count(self, count: int) -> None:
+        screen_height = self.winfo_screenheight()
+        max_height = max(420, screen_height - 32)
+        desired_height = max(HEIGHT, 252 + max(1, count) * 40)
+        self.widget_height = min(desired_height, max_height)
+        available_rows = max(1, self.widget_height - 252)
+        self.row_height = min(40.0, available_rows / max(1, count))
+        self.y = min(self.y, max(16, screen_height - self.widget_height - 16))
+        self.geometry(f"{WIDTH}x{self.widget_height}+{self.x}+{self.y}")
+        self.canvas.configure(width=WIDTH, height=self.widget_height)
 
     def refresh(self) -> None:
         if self.busy or not self.servers or self.closed:
@@ -251,7 +268,7 @@ class Widget(tk.Tk):
         start_x, start_y, old_x, old_y = self.drag_origin
         self.x = old_x + event.x_root - start_x
         self.y = old_y + event.y_root - start_y
-        self.geometry(f"{WIDTH}x{HEIGHT}+{self.x}+{self.y}")
+        self.geometry(f"{WIDTH}x{self.widget_height}+{self.x}+{self.y}")
 
     def release(self, _event: tk.Event) -> None:
         if self.drag_origin:
@@ -270,7 +287,7 @@ class Widget(tk.Tk):
         self.destroy()
 
     def draw(self) -> None:
-        image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BG)
+        image = Image.new("RGB", (WIDTH * SCALE, self.widget_height * SCALE), BG)
         d = ImageDraw.Draw(image)
 
         def box(coords, radius, fill, outline=None, width=1):
@@ -284,7 +301,7 @@ class Widget(tk.Tk):
         def line(coords, fill=LINE, width=1):
             d.line(tuple(int(v * SCALE) for v in coords), fill=fill, width=width * SCALE)
 
-        box((3, 3, WIDTH - 4, HEIGHT - 4), 18, WHITE, "#CFDEDB")
+        box((3, 3, WIDTH - 4, self.widget_height - 4), 18, WHITE, "#CFDEDB")
         # Small rack mark and a restrained header.
         box((22, 22, 45, 48), 6, TEAL_LIGHT)
         for yy in (28, 36):
@@ -326,40 +343,49 @@ class Widget(tk.Tk):
         line((22, 193, 388, 193))
 
         metric_x = {"cpu": 150, "memory": 212, "disk": 274, "gpu": 336}
-        for index, server in enumerate(self.servers[:9]):
-            top = 198 + index * 40
+        for index, server in enumerate(self.servers):
+            top = int(round(198 + index * self.row_height))
+            row_bottom = int(round(198 + (index + 1) * self.row_height))
+            row_size = max(1, row_bottom - top)
+            compact = row_size < 38
             if index % 2:
-                box((18, top, 392, top + 39), 6, "#F6FAF9")
+                box((18, top, 392, row_bottom - 1), 6, "#F6FAF9")
             payload = self.data.get(server.name)
             metrics, error = payload if payload else (None, "")
             status = FAINT if payload is None else (RED if metrics is None else TEAL)
-            d.ellipse((25 * SCALE, (top + 13) * SCALE, 32 * SCALE,
-                       (top + 20) * SCALE), fill=status)
-            text(39, top + 5, server.name, "body", INK)
-            text(39, top + 24, server.host, "tiny", MUTED)
+            dot_top = top + max(6, int(row_size * 0.33))
+            d.ellipse((25 * SCALE, dot_top * SCALE, 32 * SCALE,
+                       (dot_top + 7) * SCALE), fill=status)
+            text(39, top + (3 if compact else 5), server.name, "body", INK)
+            if not compact:
+                text(39, top + 24, server.host, "tiny", MUTED)
+            value_y = top + (3 if compact else 6)
+            bar_y = row_bottom - 6 if compact else top + 27
             for name, xpos in metric_x.items():
                 value = float(metrics[name]) if metrics and name in metrics else None
                 label = f"{value:.0f}%" if value is not None else "—"
                 fill = color_for(value) if value is not None else FAINT
-                text(xpos + 52, top + 6, label, "metric", INK if value is not None else MUTED, "ra")
-                box((xpos, top + 27, xpos + 52, top + 30), 1, TRACK)
+                text(xpos + 52, value_y, label, "metric", INK if value is not None else MUTED, "ra")
+                box((xpos, bar_y, xpos + 52, bar_y + 3), 1, TRACK)
                 if value is not None and value > 0:
-                    box((xpos, top + 27, xpos + max(2, 52 * value / 100), top + 30), 1, fill)
+                    box((xpos, bar_y, xpos + max(2, 52 * value / 100), bar_y + 3), 1, fill)
             if index < len(self.servers) - 1:
-                line((23, top + 39, 387, top + 39), LINE)
+                line((23, row_bottom, 387, row_bottom), LINE)
 
-        line((22, 563, 388, 563))
+        footer_line_y = max(563, int(round(203 + len(self.servers) * self.row_height)))
+        line((22, footer_line_y, 388, footer_line_y))
         if self.error_text:
             footer = self.error_text[:33]
         elif any(metrics is None for metrics, _ in self.data.values()):
             footer = "部分节点未连接 · 右键可查看配置"
         else:
             footer = "数据来自 SSH · 右键打开设置"
-        text(25, 575, footer, "small", MUTED)
+        footer_text_y = footer_line_y + 12
+        text(25, footer_text_y, footer, "small", MUTED)
         stamp = f"更新 {self.last_update}" if self.last_update else ("连接中" if self.busy else "等待采集")
-        text(386, 575, stamp, "small", MUTED, "ra")
+        text(386, footer_text_y, stamp, "small", MUTED, "ra")
 
-        image = image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        image = image.resize((WIDTH, self.widget_height), Image.Resampling.LANCZOS)
         self.image = ImageTk.PhotoImage(image)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.image, anchor="nw")

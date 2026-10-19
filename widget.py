@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 from ctypes import wintypes
 import json
 import os
@@ -24,6 +25,7 @@ from server_desk import CONFIG, EXAMPLE, Server, load_config, poll_server
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "widget_state.json"
+SUCCESS_FILE = ROOT / "widget_success.json"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_NAME = "ServerDeskWidget"
 WIDTH, HEIGHT, SCALE = 410, 612, 2
@@ -96,6 +98,31 @@ def save_position(x: int, y: int) -> None:
     STATE_FILE.write_text(json.dumps({"x": x, "y": y}, ensure_ascii=False), encoding="utf-8")
 
 
+def server_fingerprint(server: Server) -> str:
+    identity = json.dumps(
+        [server.host.casefold(), server.user, int(server.port)],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def load_success_history() -> set[str]:
+    try:
+        data = json.loads(SUCCESS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {item for item in data if isinstance(item, str) and len(item) == 64}
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return set()
+
+
+def save_success_history(history: set[str]) -> None:
+    temporary = SUCCESS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(sorted(history)), encoding="utf-8")
+    os.replace(temporary, SUCCESS_FILE)
+
+
 def color_for(value: float) -> str:
     return RED if value >= 90 else AMBER if value >= 75 else TEAL
 
@@ -160,6 +187,7 @@ class Widget(tk.Tk):
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="server-widget")
         self.events: queue.Queue = queue.Queue()
         self.servers: list[Server] = []
+        self.ever_connected = load_success_history()
         self.data: dict[str, tuple[dict[str, float | int] | None, str]] = {}
         self.interval = 30
         self.error_text = ""
@@ -196,10 +224,14 @@ class Widget(tk.Tk):
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self.servers = []
             self.error_text = f"配置未就绪：{exc}"
-        self.fit_to_server_count(len(self.servers))
+        self.fit_to_server_count(len(self.visible_servers()))
         self.data.clear()
         self.draw()
         self.refresh()
+
+    def visible_servers(self) -> list[Server]:
+        return [server for server in self.servers
+                if server_fingerprint(server) in self.ever_connected]
 
     def fit_to_server_count(self, count: int) -> None:
         screen_height = self.winfo_screenheight()
@@ -241,6 +273,18 @@ class Widget(tk.Tk):
                     self.timer = self.after(self.interval * 1000, self.refresh)
                 else:
                     self.data[name] = payload
+                    metrics, _error = payload
+                    if metrics is not None:
+                        server = next((item for item in self.servers if item.name == name), None)
+                        if server is not None:
+                            fingerprint = server_fingerprint(server)
+                            if fingerprint not in self.ever_connected:
+                                self.ever_connected.add(fingerprint)
+                                try:
+                                    save_success_history(self.ever_connected)
+                                except OSError:
+                                    pass
+                                self.fit_to_server_count(len(self.visible_servers()))
                 self.draw()
         except queue.Empty:
             pass
@@ -308,16 +352,18 @@ class Widget(tk.Tk):
             box((27, yy, 40, yy + 5), 2, "#88C9BF")
             d.ellipse((29 * SCALE, (yy + 2) * SCALE, 31 * SCALE, (yy + 4) * SCALE), fill=TEAL)
         text(55, 20, "服务器概览", "title")
-        text(56, 46, f"{len(self.servers)} 台节点  ·  {self.interval} 秒刷新", "small", MUTED)
+        visible_servers = self.visible_servers()
+        text(56, 46, f"曾连通 {len(visible_servers)} / 配置 {len(self.servers)} 台  ·  {self.interval} 秒刷新", "small", MUTED)
         d.arc((362 * SCALE, 25 * SCALE, 386 * SCALE, 49 * SCALE),
               40, 325, fill=TEAL, width=2 * SCALE)
         d.polygon([(386 * SCALE, 29 * SCALE), (388 * SCALE, 37 * SCALE),
                    (380 * SCALE, 36 * SCALE)], fill=TEAL)
 
-        total = len(self.servers)
-        online = sum(data is not None for data, _ in self.data.values())
+        total = len(visible_servers)
+        visible_data = [self.data.get(server.name, (None, "")) for server in visible_servers]
+        online = sum(metrics is not None for metrics, _ in visible_data)
         attention = 0
-        for metrics, _ in self.data.values():
+        for metrics, _ in visible_data:
             if metrics is None or max((float(metrics[k]) for k in ("cpu", "memory", "disk", "gpu")
                                        if k in metrics), default=0) >= 90:
                 attention += 1
@@ -343,7 +389,7 @@ class Widget(tk.Tk):
         line((22, 193, 388, 193))
 
         metric_x = {"cpu": 150, "memory": 212, "disk": 274, "gpu": 336}
-        for index, server in enumerate(self.servers):
+        for index, server in enumerate(visible_servers):
             top = int(round(198 + index * self.row_height))
             row_bottom = int(round(198 + (index + 1) * self.row_height))
             row_size = max(1, row_bottom - top)
@@ -369,10 +415,15 @@ class Widget(tk.Tk):
                 box((xpos, bar_y, xpos + 52, bar_y + 3), 1, TRACK)
                 if value is not None and value > 0:
                     box((xpos, bar_y, xpos + max(2, 52 * value / 100), bar_y + 3), 1, fill)
-            if index < len(self.servers) - 1:
+            if index < len(visible_servers) - 1:
                 line((23, row_bottom, 387, row_bottom), LINE)
 
-        footer_line_y = max(563, int(round(203 + len(self.servers) * self.row_height)))
+        if not visible_servers:
+            box((18, 262, 392, 362), 13, "#F6FAF9")
+            text(205, 297, "等待首次成功连接", "body", INK, "mm")
+            text(205, 327, f"后台仍在检测 {len(self.servers)} 台配置服务器", "small", MUTED, "mm")
+
+        footer_line_y = max(563, int(round(203 + len(visible_servers) * self.row_height)))
         line((22, footer_line_y, 388, footer_line_y))
         if self.error_text:
             footer = self.error_text[:33]
